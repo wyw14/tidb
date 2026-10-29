@@ -21,6 +21,7 @@ import (
 	"strconv"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -699,6 +700,139 @@ func (b *builtinCRC32Sig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, result
 		}
 	}
 	return nil
+}
+
+func (b *builtinCRC32CSig) vectorized() bool {
+	return true
+}
+
+func (b *builtinCRC32CSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
+	n := input.NumRows()
+	buf, err := b.bufAllocator.get()
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(buf)
+	if err := b.args[0].VecEvalString(ctx, input, buf); err != nil {
+		return err
+	}
+	result.ResizeInt64(n, false)
+	i64s := result.Int64s()
+	result.MergeNulls(buf)
+	for i := range i64s {
+		if !buf.IsNull(i) {
+			i64s[i] = int64(crc32.Checksum(buf.GetBytes(i), crc32CChecksumTable))
+		}
+	}
+	return nil
+}
+
+func (b *builtinCRC32CCombineSig) vectorized() bool {
+	return true
+}
+
+func (b *builtinCRC32CCombineSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
+	n := input.NumRows()
+	argCols := make([]*chunk.Column, len(b.args))
+	for i := range b.args {
+		buf, err := b.bufAllocator.get()
+		if err != nil {
+			return err
+		}
+		defer b.bufAllocator.put(buf)
+		switch b.args[i].GetType(ctx).EvalType() {
+		case types.ETInt:
+			err = b.args[i].VecEvalInt(ctx, input, buf)
+		case types.ETReal:
+			err = b.args[i].VecEvalReal(ctx, input, buf)
+		case types.ETDecimal:
+			err = b.args[i].VecEvalDecimal(ctx, input, buf)
+		case types.ETVectorFloat32:
+			return errors.Errorf("%s argument cannot be a vector", ast.CRC32CCombine)
+		default:
+			err = b.args[i].VecEvalString(ctx, input, buf)
+		}
+		if err != nil {
+			return err
+		}
+		argCols[i] = buf
+	}
+
+	result.ResizeInt64(n, false)
+	for i := range argCols {
+		result.MergeNulls(argCols[i])
+	}
+	i64s := result.Int64s()
+	for i := 0; i < n; i++ {
+		if result.IsNull(i) {
+			continue
+		}
+		left, err := crc32CUintFromVecArg(ctx, b.args[0], argCols[0], input, i, crc32CMaxChecksum, "BIGINT UNSIGNED")
+		if err != nil {
+			return err
+		}
+		right, err := crc32CUintFromVecArg(ctx, b.args[1], argCols[1], input, i, crc32CMaxChecksum, "BIGINT UNSIGNED")
+		if err != nil {
+			return err
+		}
+		length, err := crc32CUintFromVecArg(ctx, b.args[2], argCols[2], input, i, crc32CMaxCombineLength, "BIGINT")
+		if err != nil {
+			return err
+		}
+		i64s[i] = int64(crc32CCombine(uint32(left), uint32(right), length))
+	}
+	return nil
+}
+
+// crc32CUintFromVecArg strictly extracts an integer argument from a vectorized
+// input column. It accepts exactly the same values and rejects exactly the same
+// values as the scalar datum conversion in crc32CDatumToUint so that row-by-row
+// and vectorized evaluation produce identical results.
+func crc32CUintFromVecArg(ctx EvalContext, arg Expression, col *chunk.Column, input *chunk.Chunk, rowIdx int,
+	maxValue uint64, typeName string) (uint64, error) {
+	ft := arg.GetType(ctx)
+	switch ft.EvalType() {
+	case types.ETInt:
+		// VecEvalInt already decodes BIT columns into a plain int64 column.
+		if mysql.HasUnsignedFlag(ft.GetFlag()) {
+			u := col.GetUint64(rowIdx)
+			if u > maxValue {
+				return 0, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+			}
+			return u, nil
+		}
+		v := col.GetInt64(rowIdx)
+		if v < 0 {
+			return 0, crc32COverflowError(typeName, strconv.FormatInt(v, 10))
+		}
+		u := uint64(v)
+		if u > maxValue {
+			return 0, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+		}
+		return u, nil
+	case types.ETReal:
+		if ft.GetType() == mysql.TypeFloat {
+			f := float64(col.GetFloat32(rowIdx))
+			return crc32CFloatToUint(f, maxValue, typeName, strconv.FormatFloat(f, 'g', -1, 32))
+		}
+		f := col.GetFloat64(rowIdx)
+		return crc32CFloatToUint(f, maxValue, typeName, strconv.FormatFloat(f, 'g', -1, 64))
+	case types.ETDecimal:
+		return crc32CDecimalToUint(col.GetDecimal(rowIdx), maxValue, typeName)
+	}
+	// ENUM/SET are hybrid types whose string form is their element name but
+	// whose numeric form is their ordinal value, so take the scalar datum path.
+	if tp := ft.GetType(); tp == mysql.TypeEnum || tp == mysql.TypeSet {
+		d, err := arg.Eval(ctx, input.GetRow(rowIdx))
+		if err != nil {
+			return 0, err
+		}
+		v, _, err := crc32CDatumToUint(typeCtx(ctx), d, maxValue, typeName)
+		return v, err
+	}
+	// Everything else (strings, temporal types, JSON, ...) was evaluated as
+	// text and must be a canonical integral literal.
+	return crc32CStringToUint(col.GetString(rowIdx), maxValue, typeName)
 }
 
 func (b *builtinPISig) vectorized() bool {

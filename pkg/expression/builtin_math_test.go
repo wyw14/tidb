@@ -15,6 +15,7 @@
 package expression
 
 import (
+	"hash/crc32"
 	"math"
 	"runtime"
 	"testing"
@@ -602,6 +603,201 @@ func TestCRC32(t *testing.T) {
 			require.Equal(t, c.result, d.GetInt64())
 		}
 	}
+}
+
+func TestCRC32C(t *testing.T) {
+	ctx := createContext(t)
+	tbl := []struct {
+		input  []any
+		chs    string
+		result int64
+		isNull bool
+	}{
+		{[]any{nil}, "utf8", 0, true},
+		{[]any{""}, "utf8", 0, false},
+		// 0xE3069283 is the standard Castagnoli check value for "123456789".
+		{[]any{"123456789"}, "utf8", 3808858755, false},
+		{[]any{"hello"}, "utf8", 2591144780, false},
+		{[]any{"mysql"}, "utf8", 4136474168, false},
+		{[]any{"MySQL"}, "utf8", 1398257063, false},
+		{[]any{"-1"}, "utf8", 2354996337, false},
+		{[]any{-1}, "utf8", 2354996337, false},
+	}
+	for _, c := range tbl {
+		err := ctx.GetSessionVars().SetSystemVar(vardef.CharacterSetConnection, c.chs)
+		require.NoError(t, err)
+		f, err := newFunctionForTest(ctx, ast.CRC32C, primitiveValsToConstants(ctx, c.input)...)
+		require.NoError(t, err)
+		require.True(t, mysql.HasUnsignedFlag(f.GetType(ctx).GetFlag()))
+		d, err := f.Eval(ctx, chunk.Row{})
+		require.NoError(t, err)
+		if c.isNull {
+			require.True(t, d.IsNull())
+		} else {
+			require.Equal(t, c.result, d.GetInt64())
+		}
+	}
+}
+
+func TestCRC32CCombine(t *testing.T) {
+	ctx := createContext(t)
+	tab := crc32.MakeTable(crc32.Castagnoli)
+	checksum := func(b []byte) int64 {
+		return int64(crc32.Checksum(b, tab))
+	}
+
+	evalCombine := func(args ...any) (int64, bool, error) {
+		f, err := newFunctionForTest(ctx, ast.CRC32CCombine, primitiveValsToConstants(ctx, args)...)
+		require.NoError(t, err)
+		require.True(t, mysql.HasUnsignedFlag(f.GetType(ctx).GetFlag()))
+		d, err := f.Eval(ctx, chunk.Row{})
+		if err != nil {
+			return 0, false, err
+		}
+		if d.IsNull() {
+			return 0, true, nil
+		}
+		return d.GetInt64(), false, nil
+	}
+
+	// Hard-coded equivalence checks against CRC32C of the concatenated bytes.
+	left1, right1 := []byte("pingcap"), []byte(".com")
+	v, isNull, err := evalCombine(checksum(left1), checksum(right1), int64(len(right1)))
+	require.NoError(t, err)
+	require.False(t, isNull)
+	require.Equal(t, int64(1689851294), v)
+	require.Equal(t, checksum(append(append([]byte{}, left1...), right1...)), v)
+
+	left2 := []byte("The quick brown fox jumps over the lazy dog")
+	right2 := []byte(" (second half)")
+	v, _, err = evalCombine(checksum(left2), checksum(right2), int64(len(right2)))
+	require.NoError(t, err)
+	require.Equal(t, int64(3071515873), v)
+	require.Equal(t, checksum(append(append([]byte{}, left2...), right2...)), v)
+
+	// A zero right length returns the left checksum unchanged, even when the
+	// supplied right checksum is non-zero.
+	v, _, err = evalCombine(int64(123), int64(456), int64(0))
+	require.NoError(t, err)
+	require.Equal(t, int64(123), v)
+
+	// Empty left block: checksum 0, result is the right checksum.
+	v, _, err = evalCombine(int64(0), checksum(right1), int64(len(right1)))
+	require.NoError(t, err)
+	require.Equal(t, checksum(right1), v)
+
+	// Empty right block: both checksum and length 0, result is the left checksum.
+	v, _, err = evalCombine(checksum(left1), int64(0), int64(0))
+	require.NoError(t, err)
+	require.Equal(t, checksum(left1), v)
+
+	// Property checks across many lengths, including byte/power-of-two
+	// boundaries. The right block is a deterministic pseudo-random byte
+	// sequence; this per-byte reference computation only exists in the test.
+	const rightMaxLen = 70000
+	rightData := make([]byte, rightMaxLen)
+	seed := uint64(0x123456789abcdef0)
+	for i := range rightData {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		rightData[i] = byte(seed >> 33)
+	}
+	for _, left := range [][]byte{nil, []byte(""), {'a'}, []byte("pingcap"), left2} {
+		crcLeft := checksum(left)
+		rightLens := []int{0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+			127, 128, 129, 255, 256, 257, 1000, 4095, 4096, 4097, 65535, 65536, 65537, rightMaxLen}
+		for _, n := range rightLens {
+			right := rightData[:n]
+			got, isNull, err := evalCombine(crcLeft, checksum(right), int64(n))
+			require.NoError(t, err)
+			require.False(t, isNull)
+			joined := make([]byte, 0, len(left)+n)
+			joined = append(joined, left...)
+			joined = append(joined, right...)
+			require.Equal(t, checksum(joined), got,
+				"left=%q rightLen=%d crcLeft=%d crcRight=%d", string(left), n, crcLeft, checksum(right))
+		}
+	}
+
+	// Lengths far beyond any allocatable buffer must still combine correctly.
+	// Real concatenation cannot verify these, so check the linearity identity
+	// combine(combine(x, y, a), z, b) == combine(x, combine(y, z, b), a+b) at
+	// lengths around 2^62, which also proves no buffer is sized by the length.
+	const hugeA = uint64(1) << 62
+	const hugeB = uint64(12345678901)
+	const hugeSum = hugeA + hugeB
+	require.LessOrEqual(t, hugeSum, crc32CMaxCombineLength)
+	inner := crc32CCombine(0x01020304, 0x11223344, hugeA)
+	one := crc32CCombine(inner, 0x55667788, hugeB)
+	other := crc32CCombine(0x01020304, crc32CCombine(0x11223344, 0x55667788, hugeB), hugeSum)
+	require.Equal(t, one, other)
+
+	// Boundary-valid values are accepted.
+	v, _, err = evalCombine(uint64(crc32CMaxChecksum), uint64(crc32CMaxChecksum), uint64(crc32CMaxCombineLength))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, v, int64(0))
+	require.LessOrEqual(t, uint64(v), crc32CMaxChecksum)
+
+	// Integral-looking decimals, floats and numeric strings are accepted.
+	v, isNull, err = evalCombine(5.0, 0.0, 0.0)
+	require.NoError(t, err)
+	require.False(t, isNull)
+	require.Equal(t, int64(5), v)
+	v, _, err = evalCombine(types.NewDecFromInt(5), types.NewDecFromInt(0), types.NewDecFromInt(0))
+	require.NoError(t, err)
+	require.Equal(t, int64(5), v)
+	v, _, err = evalCombine("5", "0", "0")
+	require.NoError(t, err)
+	require.Equal(t, int64(5), v)
+
+	// Any SQL NULL argument yields SQL NULL.
+	for _, args := range [][]any{
+		{nil, int64(0), int64(0)},
+		{int64(0), nil, int64(0)},
+		{int64(0), int64(0), nil},
+	} {
+		_, isNull, err = evalCombine(args...)
+		require.NoError(t, err)
+		require.True(t, isNull)
+	}
+
+	// Illegal ranges and non-integer arguments are errors.
+	fracDec := new(types.MyDecimal)
+	require.NoError(t, fracDec.FromString([]byte("1.50")))
+	errorCases := [][]any{
+		{int64(-1), int64(0), int64(0)},                       // negative left checksum
+		{int64(0), int64(-1), int64(0)},                       // negative right checksum
+		{int64(4294967296), int64(0), int64(0)},               // left checksum too large
+		{int64(0), int64(4294967296), int64(0)},               // right checksum too large
+		{uint64(1) << 32, int64(0), int64(0)},                 // left checksum at 2^32
+		{int64(0), int64(0), int64(-1)},                       // negative length
+		{int64(0), int64(0), uint64(1) << 63},                 // length at 2^63
+		{1.5, int64(0), int64(0)},                             // fractional left checksum
+		{int64(0), 1.5, int64(0)},                             // fractional right checksum
+		{int64(0), int64(0), 1.5},                             // fractional length
+		{math.NaN(), int64(0), int64(0)},                      // NaN
+		{int64(0), math.Inf(1), int64(0)},                     // +Inf
+		{fracDec, int64(0), int64(0)},                         // decimal with fractional part
+		{"1.5", int64(0), int64(0)},                           // fractional numeric string
+		{"abc", int64(0), int64(0)},                           // non-numeric string
+		{int64(0), int64(0), "12x"},                           // trailing garbage string
+		{4294967296.0, int64(0), int64(0)},                    // float checksum out of range
+		{int64(0), int64(0), float64(crc32CMaxCombineLength)}, // float length above max
+	}
+	for i, args := range errorCases {
+		f, buildErr := newFunctionForTest(ctx, ast.CRC32CCombine, primitiveValsToConstants(ctx, args)...)
+		if buildErr != nil {
+			continue // an error during constant folding satisfies the "must error" contract
+		}
+		_, err := f.Eval(ctx, chunk.Row{})
+		require.Errorf(t, err, "case %d: expected error for args %#v", i, args)
+	}
+
+	// Wrong argument counts are rejected at build time.
+	_, err = newFunctionForTest(ctx, ast.CRC32CCombine,
+		primitiveValsToConstants(ctx, []any{int64(1), int64(2)})...)
+	require.Error(t, err)
+	_, err = newFunctionForTest(ctx, ast.CRC32C)
+	require.Error(t, err)
 }
 
 func TestConv(t *testing.T) {

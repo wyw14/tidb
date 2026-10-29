@@ -25,7 +25,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -206,11 +205,11 @@ func tryMakeImageOnce(t testing.TB) (retry bool, err error) {
 	defer lock.Close()
 
 	// Prevent other process from creating the image concurrently
-	err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	err = lockFileExclusive(lock)
 	if err != nil {
 		return true, nil
 	}
-	defer func() { err = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	defer func() { err = unlockFile(lock) }()
 
 	// Now this is the only instance to do the operation.
 	store, err := mockstore.NewMockStore(

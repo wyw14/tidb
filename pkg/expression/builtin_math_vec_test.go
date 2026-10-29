@@ -151,6 +151,56 @@ var vecBuiltinMathCases = map[string][]vecExprBenchCase{
 	ast.CRC32: {
 		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETString}},
 	},
+	ast.CRC32C: {
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETString}},
+	},
+	ast.CRC32CCombine: {
+		// All inputs must stay inside the valid ranges because out-of-range or
+		// non-integral inputs are rejected by design.
+		{
+			retEvalType:   types.ETInt,
+			childrenTypes: []types.EvalType{types.ETInt, types.ETInt, types.ETInt},
+			childrenFieldTypes: []*types.FieldType{
+				types.NewFieldTypeBuilder().SetType(mysql.TypeLonglong).SetFlag(mysql.UnsignedFlag).BuildP(),
+				types.NewFieldTypeBuilder().SetType(mysql.TypeLonglong).SetFlag(mysql.UnsignedFlag).BuildP(),
+				types.NewFieldType(mysql.TypeLonglong),
+			},
+			geners: []dataGenerator{
+				newRangeInt64Gener(0, 1<<32),
+				newRangeInt64Gener(0, 1<<32),
+				newRangeInt64Gener(0, 1<<20),
+			},
+		},
+		// Integral floats and decimals must be accepted and must produce the
+		// same result in scalar and vectorized evaluation.
+		{
+			retEvalType:   types.ETInt,
+			childrenTypes: []types.EvalType{types.ETReal, types.ETReal, types.ETReal},
+			geners: []dataGenerator{
+				newSelectRealGener([]float64{0, 1, 17, 1024, 1 << 24, 4294967295}),
+				newSelectRealGener([]float64{0, 2, 33, 2048, 999999}),
+				newSelectRealGener([]float64{0, 1, 8, 64, 100000}),
+			},
+		},
+		{
+			retEvalType:   types.ETInt,
+			childrenTypes: []types.EvalType{types.ETDecimal, types.ETDecimal, types.ETDecimal},
+			geners: []dataGenerator{
+				&integralDecimalGener{rangeInt64Gener: *newRangeInt64Gener(0, 1<<32)},
+				&integralDecimalGener{rangeInt64Gener: *newRangeInt64Gener(0, 1<<32)},
+				&integralDecimalGener{rangeInt64Gener: *newRangeInt64Gener(0, 1<<20)},
+			},
+		},
+	},
+}
+
+// integralDecimalGener generates integral decimal values in [begin, end).
+type integralDecimalGener struct {
+	rangeInt64Gener
+}
+
+func (g *integralDecimalGener) gen() any {
+	return types.NewDecFromInt(g.rangeInt64Gener.gen().(int64))
 }
 
 var vecBuiltinMathCases1 = map[string][]vecExprBenchCase{

@@ -27,6 +27,7 @@ import (
 
 	perrors "github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/charset"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -46,6 +47,8 @@ var (
 	_ functionClass = &powFunctionClass{}
 	_ functionClass = &convFunctionClass{}
 	_ functionClass = &crc32FunctionClass{}
+	_ functionClass = &crc32CFunctionClass{}
+	_ functionClass = &crc32CCombineFunctionClass{}
 	_ functionClass = &signFunctionClass{}
 	_ functionClass = &sqrtFunctionClass{}
 	_ functionClass = &acosFunctionClass{}
@@ -92,6 +95,8 @@ var (
 	_ builtinFunc = &builtinPowSig{}
 	_ builtinFunc = &builtinConvSig{}
 	_ builtinFunc = &builtinCRC32Sig{}
+	_ builtinFunc = &builtinCRC32CSig{}
+	_ builtinFunc = &builtinCRC32CCombineSig{}
 	_ builtinFunc = &builtinSignSig{}
 	_ builtinFunc = &builtinSqrtSig{}
 	_ builtinFunc = &builtinAcosSig{}
@@ -1482,6 +1487,323 @@ func (b *builtinCRC32Sig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, 
 	}
 	r := crc32.ChecksumIEEE([]byte(x))
 	return int64(r), false, nil
+}
+
+// crc32CChecksumTable uses the Castagnoli polynomial (0x1EDC6F41 in normal
+// representation, 0x82F63B78 reflected). hash/crc32 initializes the register
+// with 0xFFFFFFFF and XORes the result with 0xFFFFFFFF, so CRC32C('') is 0,
+// matching CRC32('').
+var crc32CChecksumTable = crc32.MakeTable(crc32.Castagnoli)
+
+const (
+	// crc32CReflectedPoly is the Castagnoli CRC-32 polynomial in reflected form.
+	crc32CReflectedPoly uint32 = 0x82F63B78
+	// crc32CMaxChecksum is the largest valid checksum argument: 2^32-1.
+	crc32CMaxChecksum uint64 = 1<<32 - 1
+	// crc32CMaxCombineLength is the largest valid right_length argument: 2^63-1.
+	crc32CMaxCombineLength uint64 = 1<<63 - 1
+	// crc32CCombineMaxBits is the number of precomputed zero-byte operators;
+	// 2^62 bytes is the largest power of two that fits into right_length.
+	crc32CCombineMaxBits = 63
+)
+
+// crc32CZeroByteOps[k] is the GF(2) linear operator, represented as 32 bit
+// rows, that advances a CRC-32C register by 2^k zero bytes. It is precomputed
+// once so CRC32C_COMBINE takes O(log(right_length)) time without allocating a
+// buffer proportional to the length or iterating over the missing right bytes.
+var crc32CZeroByteOps [crc32CCombineMaxBits][32]uint32
+
+func init() {
+	// Operator for one zero bit: feeding a zero bit shifts the reflected
+	// register right by one and XORes the polynomial when the shifted out bit
+	// is set. Its rows are the reflected polynomial and shifted unit vectors.
+	var oneZeroBit [32]uint32
+	oneZeroBit[0] = crc32CReflectedPoly
+	row := uint32(1)
+	for i := 1; i < 32; i++ {
+		oneZeroBit[i] = row
+		row <<= 1
+	}
+	twoZeroBits := gf2MatrixSquare(oneZeroBit)
+	fourZeroBits := gf2MatrixSquare(twoZeroBits)
+	// Squaring the four-bit operator once more covers eight zero bits, i.e.
+	// one zero byte.
+	crc32CZeroByteOps[0] = gf2MatrixSquare(fourZeroBits)
+	for k := 1; k < len(crc32CZeroByteOps); k++ {
+		crc32CZeroByteOps[k] = gf2MatrixSquare(crc32CZeroByteOps[k-1])
+	}
+}
+
+// gf2MatrixTimes applies a 32x32 binary matrix represented by its rows to vec.
+func gf2MatrixTimes(mat *[32]uint32, vec uint32) uint32 {
+	var sum uint32
+	for i := 0; vec != 0; i++ {
+		if vec&1 != 0 {
+			sum ^= mat[i]
+		}
+		vec >>= 1
+	}
+	return sum
+}
+
+// gf2MatrixSquare returns mat multiplied by itself over GF(2).
+func gf2MatrixSquare(mat [32]uint32) [32]uint32 {
+	var square [32]uint32
+	for i := range square {
+		square[i] = gf2MatrixTimes(&mat, mat[i])
+	}
+	return square
+}
+
+// crc32CCombine folds two finished CRC-32C checksums into the checksum of the
+// concatenation of the underlying byte strings: it extends crcLeft with
+// rightLength zero bytes, which accounts for the right block's length in the
+// linear part of the CRC, and then XORes crcRight in. This is valid because
+// CRC-32C initializes the register with 0xFFFFFFFF and applies the same value
+// as final XOR; a plain XOR of the two checksums is not sufficient. When
+// rightLength is 0, crcLeft is returned unchanged.
+func crc32CCombine(crcLeft, crcRight uint32, rightLength uint64) uint32 {
+	if rightLength == 0 {
+		return crcLeft
+	}
+	for k := 0; rightLength != 0; k++ {
+		if rightLength&1 != 0 {
+			crcLeft = gf2MatrixTimes(&crc32CZeroByteOps[k], crcLeft)
+		}
+		rightLength >>= 1
+	}
+	return crcLeft ^ crcRight
+}
+
+type crc32CFunctionClass struct {
+	baseFunctionClass
+}
+
+func (c *crc32CFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
+	bf.tp.SetFlen(10)
+	bf.tp.AddFlag(mysql.UnsignedFlag)
+	sig := &builtinCRC32CSig{bf}
+	return sig, nil
+}
+
+type builtinCRC32CSig struct {
+	baseBuiltinFunc
+	// NOTE: Any new fields added here must be thread-safe or immutable during execution,
+	// as this expression may be shared across sessions.
+	// If a field does not meet these requirements, set SafeToShareAcrossSession to false.
+}
+
+func (b *builtinCRC32CSig) Clone() builtinFunc {
+	newSig := &builtinCRC32CSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals CRC32C(expr), the Castagnoli variant of CRC32.
+func (b *builtinCRC32CSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, error) {
+	x, isNull, err := b.args[0].EvalString(ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return int64(crc32.Checksum([]byte(x), crc32CChecksumTable)), false, nil
+}
+
+type crc32CCombineFunctionClass struct {
+	baseFunctionClass
+}
+
+func (c *crc32CCombineFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	// Arguments are not wrapped with implicit integer casts here: evalInt
+	// validates them itself so that non-integral values (for example 1.5) and
+	// out-of-range values are reported as errors instead of being silently
+	// rounded or clamped.
+	retTp := types.NewFieldTypeBuilder().
+		SetType(mysql.TypeLonglong).
+		SetFlag(mysql.BinaryFlag).
+		SetFlen(mysql.MaxIntWidth).
+		AddFlag(mysql.UnsignedFlag).
+		BuildP()
+	retTp.SetCharset(charset.CharsetBin)
+	retTp.SetCollate(charset.CollationBin)
+	bf, err := newBaseBuiltinFunc(ctx, c.funcName, args, retTp)
+	if err != nil {
+		return nil, err
+	}
+	sig := &builtinCRC32CCombineSig{bf}
+	return sig, nil
+}
+
+type builtinCRC32CCombineSig struct {
+	baseBuiltinFunc
+	// NOTE: Any new fields added here must be thread-safe or immutable during execution,
+	// as this expression may be shared across sessions.
+	// If a field does not meet these requirements, set SafeToShareAcrossSession to false.
+}
+
+func (b *builtinCRC32CCombineSig) Clone() builtinFunc {
+	newSig := &builtinCRC32CCombineSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals CRC32C_COMBINE(crc_left, crc_right, right_length).
+//
+// crc_left and crc_right are finished CRC32C checksums in [0, 2^32-1] and
+// right_length is the byte length of the right block in [0, 2^63-1]. The
+// result equals CRC32C(left_bytes || right_bytes); the original bytes are not
+// needed. Any SQL NULL argument yields NULL.
+func (b *builtinCRC32CCombineSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, error) {
+	left, isNull, err := crc32CEvalChecksumArg(ctx, b.args[0], row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	right, isNull, err := crc32CEvalChecksumArg(ctx, b.args[1], row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	length, isNull, err := crc32CEvalLengthArg(ctx, b.args[2], row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return int64(crc32CCombine(uint32(left), uint32(right), length)), false, nil
+}
+
+func crc32CEvalChecksumArg(ctx EvalContext, arg Expression, row chunk.Row) (uint64, bool, error) {
+	d, err := arg.Eval(ctx, row)
+	if err != nil {
+		return 0, false, err
+	}
+	return crc32CDatumToUint(typeCtx(ctx), d, crc32CMaxChecksum, "BIGINT UNSIGNED")
+}
+
+func crc32CEvalLengthArg(ctx EvalContext, arg Expression, row chunk.Row) (uint64, bool, error) {
+	d, err := arg.Eval(ctx, row)
+	if err != nil {
+		return 0, false, err
+	}
+	return crc32CDatumToUint(typeCtx(ctx), d, crc32CMaxCombineLength, "BIGINT")
+}
+
+// crc32CDatumToUint converts a datum to an unsigned integer strictly: NULL is
+// passed through, decimals and floats must have no fractional part, strings
+// must be canonical integer literals, and the result must be in [0, maxValue].
+// It deliberately does not use the implicit integer cast, which rounds 1.5 to
+// 2 without an error. typeName is the MySQL type name used in overflow errors.
+func crc32CDatumToUint(tctx types.Context, d types.Datum, maxValue uint64, typeName string) (uint64, bool, error) {
+	switch d.Kind() {
+	case types.KindNull:
+		return 0, true, nil
+	case types.KindInt64:
+		v := d.GetInt64()
+		if v < 0 {
+			return 0, false, crc32COverflowError(typeName, strconv.FormatInt(v, 10))
+		}
+		u := uint64(v)
+		if u > maxValue {
+			return 0, false, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+		}
+		return u, false, nil
+	case types.KindUint64:
+		u := d.GetUint64()
+		if u > maxValue {
+			return 0, false, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+		}
+		return u, false, nil
+	case types.KindFloat32:
+		f := float64(d.GetFloat32())
+		v, err := crc32CFloatToUint(f, maxValue, typeName, strconv.FormatFloat(f, 'g', -1, 32))
+		return v, false, err
+	case types.KindFloat64:
+		f := d.GetFloat64()
+		v, err := crc32CFloatToUint(f, maxValue, typeName, strconv.FormatFloat(f, 'g', -1, 64))
+		return v, false, err
+	case types.KindMysqlDecimal:
+		v, err := crc32CDecimalToUint(d.GetMysqlDecimal(), maxValue, typeName)
+		return v, false, err
+	case types.KindMysqlEnum:
+		u := uint64(d.GetMysqlEnum().Value)
+		if u > maxValue {
+			return 0, false, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+		}
+		return u, false, nil
+	case types.KindMysqlSet:
+		u := d.GetMysqlSet().Value
+		if u > maxValue {
+			return 0, false, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+		}
+		return u, false, nil
+	case types.KindBinaryLiteral, types.KindMysqlBit:
+		u, err := d.GetMysqlBit().ToInt(tctx)
+		if err != nil {
+			return 0, false, err
+		}
+		if u > maxValue {
+			return 0, false, crc32COverflowError(typeName, strconv.FormatUint(u, 10))
+		}
+		return u, false, nil
+	default:
+		// Strings and other types (time, JSON, ...) go through their canonical
+		// text representation, which only accepts integral numbers.
+		v, err := crc32CStringToUint(d.GetString(), maxValue, typeName)
+		return v, false, err
+	}
+}
+
+// crc32CDecimalToUint validates that dec is an integral decimal in [0, maxValue].
+func crc32CDecimalToUint(dec *types.MyDecimal, maxValue uint64, typeName string) (uint64, error) {
+	var trunc types.MyDecimal
+	if err := dec.Round(&trunc, 0, types.ModeTruncate); err != nil {
+		return 0, err
+	}
+	if trunc.Compare(dec) != 0 {
+		return 0, crc32CNonIntegerError(dec.String())
+	}
+	v, err := trunc.ToUint()
+	if err != nil || v > maxValue {
+		return 0, crc32COverflowError(typeName, dec.String())
+	}
+	return v, nil
+}
+
+// crc32CFloatToUint validates that f is an integral float in [0, maxValue].
+// The upper-bound comparison uses maxValue+1 so that values which only have a
+// float representation above the integer maximum are rejected.
+func crc32CFloatToUint(f float64, maxValue uint64, typeName, value string) (uint64, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
+		return 0, crc32CNonIntegerError(value)
+	}
+	if f < 0 || f >= float64(maxValue)+1 {
+		return 0, crc32COverflowError(typeName, value)
+	}
+	return uint64(f), nil
+}
+
+// crc32CStringToUint parses s as a decimal literal and applies the same
+// integral and range checks as decimal arguments.
+func crc32CStringToUint(s string, maxValue uint64, typeName string) (uint64, error) {
+	dec := new(types.MyDecimal)
+	if err := dec.FromString([]byte(s)); err != nil {
+		return 0, crc32CNonIntegerError(s)
+	}
+	return crc32CDecimalToUint(dec, maxValue, typeName)
+}
+
+func crc32COverflowError(typeName, value string) error {
+	return types.ErrOverflow.GenWithStackByArgs(typeName, value)
+}
+
+func crc32CNonIntegerError(value string) error {
+	return types.ErrTruncatedWrongVal.GenWithStackByArgs("INTEGER", value)
 }
 
 type signFunctionClass struct {

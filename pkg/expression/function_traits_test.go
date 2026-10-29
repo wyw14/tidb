@@ -80,6 +80,8 @@ func TestIllegalFunctions4GeneratedColumns(t *testing.T) {
 		"cos",
 		"cot",
 		"crc32",
+		"crc32c",
+		"crc32c_combine",
 		"date",
 		"date_add",
 		"date_format",

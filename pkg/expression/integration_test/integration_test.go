@@ -4280,6 +4280,66 @@ func TestTiDBRowChecksumBuiltinAfterAddColumn(t *testing.T) {
 	require.NotEqual(t, oldChecksum, newChecksum)
 }
 
+func TestCRC32CFunctions(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// Constant evaluation: empty input returns 0, "123456789" returns the
+	// standard Castagnoli check value (0xE3069283), NULL is propagated, and
+	// the result is unsigned so 4294967295 is not shown as a negative number.
+	tk.MustQuery("select crc32c(''), crc32c('123456789'), crc32c(null), crc32c_combine(4294967295, 0, 0)").
+		Check(testkit.Rows("0 3808858755 <nil> 4294967295"))
+	// The existing IEEE CRC32 keeps its result.
+	tk.MustQuery("select crc32('123456789')").Check(testkit.Rows("3421780262"))
+
+	// Out-of-range and non-integral arguments are errors. QueryToErr is used
+	// (instead of MustContainErrMsg/ExecToErr) because these errors surface
+	// while the projection evaluates the rows.
+	mustQueryContainErr := func(sql, msg string) {
+		require.ErrorContains(t, tk.QueryToErr(sql), msg)
+	}
+	mustQueryContainErr("select crc32c_combine(-1, 0, 0)", "BIGINT UNSIGNED value is out of range")
+	mustQueryContainErr("select crc32c_combine(4294967296, 0, 0)", "BIGINT UNSIGNED value is out of range")
+	mustQueryContainErr("select crc32c_combine(0, 0, -1)", "BIGINT value is out of range")
+	mustQueryContainErr("select crc32c_combine(0, 0, 9223372036854775808)", "BIGINT value is out of range")
+	mustQueryContainErr("select crc32c_combine(1.5, 0, 0)", "Truncated incorrect INTEGER value: '1.5'")
+	mustQueryContainErr("select crc32c_combine(0, 0, 1.5)", "Truncated incorrect INTEGER value: '1.5'")
+
+	// Row-wise evaluation: CRC32C_COMBINE over the two column checksums must
+	// equal CRC32C over the concatenated bytes, including empty blocks and
+	// NULL propagation.
+	tk.MustExec("drop table if exists t_crc32c")
+	tk.MustExec("create table t_crc32c(id int primary key, a varchar(64), b varchar(64))")
+	tk.MustExec(`insert into t_crc32c values
+		(1, 'pingcap', '.com'),
+		(2, 'hello', ''),
+		(3, '', 'world'),
+		(4, null, 'x'),
+		(5, 'x', null)`)
+	tab := crc32.MakeTable(crc32.Castagnoli)
+	c := func(s string) string { return fmt.Sprint(crc32.Checksum([]byte(s), tab)) }
+	expectedRows := []string{
+		fmt.Sprintf("%s %s %s %s", c("pingcap"), c(".com"), c("pingcap.com"), c("pingcap.com")),
+		fmt.Sprintf("%s 0 %s %s", c("hello"), c("hello"), c("hello")),
+		fmt.Sprintf("0 %s %s %s", c("world"), c("world"), c("world")),
+		fmt.Sprintf("<nil> %s <nil> <nil>", c("x")),
+		fmt.Sprintf("%s <nil> <nil> <nil>", c("x")),
+	}
+	tk.MustQuery("select crc32c(a), crc32c(b), crc32c_combine(crc32c(a), crc32c(b), length(b)), crc32c(concat(a,b)) from t_crc32c order by id").
+		Check(testkit.Rows(expectedRows...))
+
+	// The length is the BYTE length; binary blocks work too.
+	tk.MustQuery("select crc32c_combine(crc32c(unhex('0102')), crc32c(unhex('0304')), length(unhex('0304'))) = crc32c(unhex(concat('0102','0304')))").
+		Check(testkit.Rows("1"))
+
+	// A zero right length returns the left checksum regardless of the right
+	// checksum; user variables exercise the non-folded scalar path.
+	tk.MustExec("set @crc32c_left = 12345")
+	tk.MustQuery("select crc32c_combine(@crc32c_left, 999, 0)").Check(testkit.Rows("12345"))
+	tk.MustQuery("select crc32c_combine(@crc32c_left, null, 0)").Check(testkit.Rows("<nil>"))
+}
+
 func TestTiDBRowChecksumBuiltin(t *testing.T) {
 	store := testkit.CreateMockStore(t)
 
