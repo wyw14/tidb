@@ -65,6 +65,7 @@ var (
 	_ functionClass = &jsonDepthFunctionClass{}
 	_ functionClass = &jsonKeysFunctionClass{}
 	_ functionClass = &jsonLengthFunctionClass{}
+	_ functionClass = &jsonDiffFunctionClass{}
 
 	_ builtinFunc = &builtinJSONTypeSig{}
 	_ builtinFunc = &builtinJSONSumCRC32Sig{}
@@ -90,6 +91,7 @@ var (
 	_ builtinFunc = &builtinJSONKeysSig{}
 	_ builtinFunc = &builtinJSONKeys2ArgsSig{}
 	_ builtinFunc = &builtinJSONLengthSig{}
+	_ builtinFunc = &builtinJSONDiffSig{}
 	_ builtinFunc = &builtinJSONValidJSONSig{}
 	_ builtinFunc = &builtinJSONValidStringSig{}
 	_ builtinFunc = &builtinJSONValidOthersSig{}
@@ -2135,4 +2137,54 @@ func (b *builtinJSONSchemaValidSig) evalInt(ctx EvalContext, row chunk.Row) (res
 	}
 	res = 1
 	return res, false, nil
+}
+
+type jsonDiffFunctionClass struct {
+	baseFunctionClass
+}
+
+type builtinJSONDiffSig struct {
+	baseBuiltinFunc
+	// NOTE: Any new fields added here must be thread-safe or immutable during execution,
+	// as this expression may be shared across sessions.
+	// If a field does not meet these requirements, set SafeToShareAcrossSession to false.
+}
+
+func (b *builtinJSONDiffSig) Clone() builtinFunc {
+	newSig := &builtinJSONDiffSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+func (c *jsonDiffFunctionClass) verifyArgs(ctx EvalContext, args []Expression) error {
+	if err := c.baseFunctionClass.verifyArgs(args); err != nil {
+		return err
+	}
+	return verifyJSONArgsType(ctx, c.funcName, true, args, 0, 1)
+}
+
+func (c *jsonDiffFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(ctx.GetEvalCtx(), args); err != nil {
+		return nil, err
+	}
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETJson, types.ETJson, types.ETJson)
+	if err != nil {
+		return nil, err
+	}
+	// JSON_DIFF is a TiDB extension and is not pushed down to coprocessors,
+	// so it keeps the default pb code.
+	sig := &builtinJSONDiffSig{bf}
+	return sig, nil
+}
+
+func (b *builtinJSONDiffSig) evalJSON(ctx EvalContext, row chunk.Row) (res types.BinaryJSON, isNull bool, err error) {
+	oldDoc, isNull, err := b.args[0].EvalJSON(ctx, row)
+	if isNull || err != nil {
+		return res, isNull, err
+	}
+	newDoc, isNull, err := b.args[1].EvalJSON(ctx, row)
+	if isNull || err != nil {
+		return res, isNull, err
+	}
+	return types.DiffBinaryJSON(oldDoc, newDoc), false, nil
 }

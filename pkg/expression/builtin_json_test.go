@@ -1456,6 +1456,81 @@ func TestJSONMergePatch(t *testing.T) {
 	}
 }
 
+func TestJSONDiff(t *testing.T) {
+	ctx := createContext(t)
+	fc := funcs[ast.JSONDiff]
+	tbl := []struct {
+		input    []any
+		expected any
+		success  bool
+	}{
+		// Any SQL NULL argument yields SQL NULL.
+		{[]any{nil, `{}`}, nil, true},
+		{[]any{`{}`, nil}, nil, true},
+		{[]any{nil, nil}, nil, true},
+		// Equal documents return an empty array.
+		{[]any{`{"a": 1}`, `{"a": 1}`}, `[]`, true},
+		{[]any{`1`, `1.0`}, `[]`, true},
+		// Root scalar replace with an empty root path.
+		{[]any{`1`, `2`}, `[{"old": 1, "new": 2, "op": "replace", "path": ""}]`, true},
+		// Object add/remove/replace, ordered by path.
+		{
+			[]any{`{"a": 1, "b": 2}`, `{"b": 3, "c": 4}`},
+			`[
+				{"op": "remove", "path": "/a", "old": 1},
+				{"op": "replace", "path": "/b", "old": 2, "new": 3},
+				{"op": "add", "path": "/c", "new": 4}
+			]`,
+			true,
+		},
+		// Recursion, whole-subtree add/remove and arrays replaced as a whole.
+		{
+			[]any{`{"a": {"x": [1, 2]}, "b": [1, 2]}`, `{"a": {"x": [1, 2]}, "b": [1, 3], "c": {}}`},
+			`[
+				{"op": "replace", "path": "/b", "old": [1, 2], "new": [1, 3]},
+				{"op": "add", "path": "/c", "new": {}}
+			]`,
+			true,
+		},
+		// A JSON null value is different from a missing member.
+		{[]any{`{"a": null}`, `{}`}, `[{"op": "remove", "path": "/a", "old": null}]`, true},
+		{[]any{`{}`, `{"a": null}`}, `[{"op": "add", "path": "/a", "new": null}]`, true},
+		// JSON Pointer escaping of '~' and '/'.
+		{
+			[]any{`{"a/b": 1, "m~n": 2}`, `{"a/b": 1, "m~n": 3}`},
+			`[{"op": "replace", "path": "/m~0n", "old": 2, "new": 3}]`,
+			true,
+		},
+		// Arguments already of the JSON type are accepted directly.
+		{
+			[]any{types.CreateBinaryJSON(int64(1)), types.CreateBinaryJSON(int64(2))},
+			`[{"old": 1, "new": 2, "op": "replace", "path": ""}]`,
+			true,
+		},
+		// Invalid JSON text reports the same error as other JSON functions.
+		{[]any{`{bad`, `{}`}, nil, false},
+		{[]any{`{}`, `{bad`}, nil, false},
+	}
+	for _, tt := range tbl {
+		args := types.MakeDatums(tt.input...)
+		f, err := fc.getFunction(ctx, datumsToConstants(args))
+		require.NoError(t, err)
+		d, err := evalBuiltinFunc(f, ctx, chunk.Row{})
+		if tt.success {
+			require.NoError(t, err)
+			if tt.expected == nil {
+				require.True(t, d.IsNull())
+			} else {
+				j, e := types.ParseBinaryJSONFromString(tt.expected.(string))
+				require.NoError(t, e)
+				require.Equal(t, j.String(), d.GetMysqlJSON().String())
+			}
+		} else {
+			require.Error(t, err)
+		}
+	}
+}
+
 func TestJSONSchemaValid(t *testing.T) {
 	ctx := createContext(t)
 	fc := funcs[ast.JSONSchemaValid]

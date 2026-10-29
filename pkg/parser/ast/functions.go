@@ -360,6 +360,7 @@ const (
 	JSONDepth         = "json_depth"
 	JSONKeys          = "json_keys"
 	JSONLength        = "json_length"
+	JSONDiff          = "json_diff"
 
 	// vector functions (tidb extension)
 	VecDims                 = "vec_dims"

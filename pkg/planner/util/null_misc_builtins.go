@@ -216,6 +216,7 @@ var nullRejectNullPreservingFunctions = map[string]struct{}{
 	ast.JSONDepth:         {},
 	ast.JSONKeys:          {},
 	ast.JSONLength:        {},
+	ast.JSONDiff:          {},
 
 	// Network address functions.
 	ast.InetAton:  {},

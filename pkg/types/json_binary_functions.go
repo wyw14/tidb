@@ -16,12 +16,14 @@ package types
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"slices"
 	"sort"
+	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -886,6 +888,130 @@ func CompareBinaryJSON(left, right BinaryJSON) int {
 		}
 	}
 	return cmp
+}
+
+// JSON difference operation names produced by DiffBinaryJSON.
+const (
+	jsonDiffOpAdd     = "add"
+	jsonDiffOpRemove  = "remove"
+	jsonDiffOpReplace = "replace"
+)
+
+// jsonDiffEntry is a single element of the difference array built by
+// DiffBinaryJSON.
+//
+// old and new point to the values at path: add sets only new, remove sets only
+// old and replace sets both. A JSON null is a regular BinaryJSON value, so a
+// nil pointer means that the object member is absent rather than holding a
+// JSON null value.
+type jsonDiffEntry struct {
+	op   string
+	path string
+	old  *BinaryJSON
+	new  *BinaryJSON
+}
+
+// DiffBinaryJSON builds a deterministic JSON array describing the structural
+// differences between oldDoc and newDoc:
+//   - Objects are compared recursively by key. Adding or removing a whole
+//     subtree emits one entry, carrying the added or removed value as-is.
+//   - Arrays are compared as a whole: any difference emits one replace entry.
+//   - A scalar or type difference at the same location emits one replace entry.
+//
+// Every entry has "op" and "path" members. add carries only "new", remove only
+// "old" and replace both. path is a JSON Pointer (RFC 6901) whose root is the
+// empty string. Entries are sorted by the byte order of path. Equal documents
+// yield an empty array. Numeric equality follows CompareBinaryJSON.
+func DiffBinaryJSON(oldDoc, newDoc BinaryJSON) BinaryJSON {
+	entries := make([]jsonDiffEntry, 0, 1)
+	collectBinaryJSONDiff(oldDoc, newDoc, "", &entries)
+	slices.SortFunc(entries, func(a, b jsonDiffEntry) int {
+		return cmp.Compare(a.path, b.path)
+	})
+	result := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		member := map[string]any{
+			"op":   entry.op,
+			"path": entry.path,
+		}
+		if entry.old != nil {
+			member["old"] = *entry.old
+		}
+		if entry.new != nil {
+			member["new"] = *entry.new
+		}
+		result = append(result, member)
+	}
+	return CreateBinaryJSON(result)
+}
+
+// collectBinaryJSONDiff appends the differences between oldDoc and newDoc at
+// the given JSON Pointer path.
+func collectBinaryJSONDiff(oldDoc, newDoc BinaryJSON, path string, entries *[]jsonDiffEntry) {
+	if CompareBinaryJSON(oldDoc, newDoc) == 0 {
+		return
+	}
+	if oldDoc.TypeCode == JSONTypeCodeObject && newDoc.TypeCode == JSONTypeCodeObject {
+		// The keys of a binary JSON object are stored in byte order, so a
+		// merge walk visits both key sets in sorted order.
+		oldCount, newCount := oldDoc.GetElemCount(), newDoc.GetElemCount()
+		i, j := 0, 0
+		for i < oldCount || j < newCount {
+			var c int
+			switch {
+			case i >= oldCount:
+				c = 1
+			case j >= newCount:
+				c = -1
+			default:
+				c = bytes.Compare(oldDoc.objectGetKey(i), newDoc.objectGetKey(j))
+			}
+			switch c {
+			case 0:
+				childPath := path + "/" + escapeJSONPointerToken(string(oldDoc.objectGetKey(i)))
+				collectBinaryJSONDiff(oldDoc.objectGetVal(i), newDoc.objectGetVal(j), childPath, entries)
+				i++
+				j++
+			case -1:
+				// The member exists only in oldDoc, so the whole subtree is removed.
+				value := oldDoc.objectGetVal(i)
+				childPath := path + "/" + escapeJSONPointerToken(string(oldDoc.objectGetKey(i)))
+				*entries = append(*entries, jsonDiffEntry{op: jsonDiffOpRemove, path: childPath, old: &value})
+				i++
+			default:
+				// The member exists only in newDoc, so the whole subtree is added.
+				value := newDoc.objectGetVal(j)
+				childPath := path + "/" + escapeJSONPointerToken(string(newDoc.objectGetKey(j)))
+				*entries = append(*entries, jsonDiffEntry{op: jsonDiffOpAdd, path: childPath, new: &value})
+				j++
+			}
+		}
+		return
+	}
+	// Arrays, scalars and type changes are replaced as a whole.
+	oldValue, newValue := oldDoc, newDoc
+	*entries = append(*entries, jsonDiffEntry{op: jsonDiffOpReplace, path: path, old: &oldValue, new: &newValue})
+}
+
+// escapeJSONPointerToken escapes one reference token of a JSON Pointer (RFC
+// 6901 section 3): '~' is encoded as "~0" and '/' as "~1".
+func escapeJSONPointerToken(token string) string {
+	if !strings.ContainsAny(token, "~/") {
+		return token
+	}
+	var builder strings.Builder
+	builder.Grow(len(token) + 2)
+	for i := 0; i < len(token); i++ {
+		switch token[i] {
+		case '~':
+			builder.WriteString("~0")
+		case '/':
+			builder.WriteString("~1")
+		default:
+			builder.WriteByte(token[i])
+		}
+	}
+	return builder.String()
 }
 
 // MergePatchBinaryJSON implements RFC7396
