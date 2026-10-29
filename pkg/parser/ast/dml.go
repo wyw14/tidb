@@ -43,6 +43,7 @@ var (
 	_ Node = &FieldList{}
 	_ Node = &GroupByClause{}
 	_ Node = &HavingClause{}
+	_ Node = &QualifyClause{}
 	_ Node = &AsOfClause{}
 	_ Node = &Join{}
 	_ Node = &Limit{}
@@ -1040,6 +1041,36 @@ func (n *HavingClause) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// QualifyClause represents qualify clause.
+type QualifyClause struct {
+	node
+	Expr ExprNode
+}
+
+// Restore implements Node interface.
+func (n *QualifyClause) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("QUALIFY ")
+	if err := n.Expr.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while restore QualifyClause.Expr")
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *QualifyClause) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*QualifyClause)
+	node, ok := n.Expr.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Expr = node.(ExprNode)
+	return v.Leave(n)
+}
+
 // OrderByClause represents order by clause.
 type OrderByClause struct {
 	node
@@ -1263,6 +1294,9 @@ type SelectStmt struct {
 	GroupBy *GroupByClause
 	// Having is the having condition.
 	Having *HavingClause
+	// Qualify is the qualify condition, which filters rows after window
+	// functions are evaluated but before DISTINCT/ORDER BY/LIMIT.
+	Qualify *QualifyClause
 	// WindowSpecs is the window specification list.
 	WindowSpecs []WindowSpec
 	// OrderBy is the ordering expression list.
@@ -1461,6 +1495,13 @@ func (n *SelectStmt) Restore(ctx *format.RestoreCtx) error {
 				}
 			}
 		}
+
+		if n.Qualify != nil {
+			ctx.WritePlain(" ")
+			if err := n.Qualify.Restore(ctx); err != nil {
+				return errors.Annotate(err, "An error occurred while restore SelectStmt.Qualify")
+			}
+		}
 	case SelectStmtKindTable:
 		if err := n.From.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while restore SelectStmt.From")
@@ -1627,6 +1668,14 @@ func (n *SelectStmt) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Having = node.(*HavingClause)
+	}
+
+	if n.Qualify != nil {
+		node, ok := n.Qualify.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Qualify = node.(*QualifyClause)
 	}
 
 	for i, list := range n.Lists {

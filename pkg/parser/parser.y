@@ -258,6 +258,7 @@ func getMaskingPolicyRestrictOp(name string) (ast.MaskingPolicyRestrictOps, bool
 	precisionType     "PRECISION"
 	primary           "PRIMARY"
 	procedure         "PROCEDURE"
+	qualify           "QUALIFY"
 	rangeKwd          "RANGE"
 	rank              "RANK"
 	read              "READ"
@@ -1287,6 +1288,7 @@ func getMaskingPolicyRestrictOp(name string) (ast.MaskingPolicyRestrictOps, bool
 	StatementScope                         "The scope of statement"
 	GroupByClause                          "GROUP BY clause"
 	HavingClause                           "HAVING clause"
+	QualifyClause                          "QUALIFY clause"
 	AsOfClause                             "AS OF clause"
 	AsOfClauseOpt                          "AS OF clause optional"
 	HandleRange                            "handle range"
@@ -7516,6 +7518,15 @@ HavingClause:
 		$$ = &ast.HavingClause{Expr: $2}
 	}
 
+QualifyClause:
+	{
+		$$ = nil
+	}
+|	"QUALIFY" Expression
+	{
+		$$ = &ast.QualifyClause{Expr: $2}
+	}
+
 AsOfClauseOpt:
 	%prec empty
 	{
@@ -10500,13 +10511,13 @@ SelectStmtFromDualTable:
 	}
 
 SelectStmtFromTable:
-	SelectStmtBasic "FROM" TableRefsClause WhereClauseOptional SelectStmtGroup HavingClause WindowClauseOptional
+	SelectStmtBasic "FROM" TableRefsClause WhereClauseOptional SelectStmtGroup HavingClause WindowClauseOptional QualifyClause
 	{
 		st := $1.(*ast.SelectStmt)
 		st.From = $3.(*ast.TableRefsClause)
 		lastField := st.Fields.Fields[len(st.Fields.Fields)-1]
 		if lastField.Expr != nil && lastField.AsName.O == "" {
-			lastEnd := parser.endOffset(&yyS[yypt-5])
+			lastEnd := parser.endOffset(&yyS[yypt-6])
 			parser.setNodeText(lastField, parser.src[lastField.Offset:lastEnd])
 		}
 		if $4 != nil {
@@ -10520,6 +10531,9 @@ SelectStmtFromTable:
 		}
 		if $7 != nil {
 			st.WindowSpecs = ($7.([]ast.WindowSpec))
+		}
+		if $8 != nil {
+			st.Qualify = $8.(*ast.QualifyClause)
 		}
 		$$ = st
 	}
@@ -10597,11 +10611,11 @@ RepeatableOpt:
 	}
 
 SelectStmt:
-	SelectStmtBasic WhereClauseOptional SelectStmtGroup OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+	SelectStmtBasic WhereClauseOptional SelectStmtGroup QualifyClause OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
 	{
 		st := $1.(*ast.SelectStmt)
-		if $6 != nil {
-			st.LockInfo = $6.(*ast.SelectLockInfo)
+		if $7 != nil {
+			st.LockInfo = $7.(*ast.SelectLockInfo)
 		}
 		if $2 != nil {
 			st.Where = $2.(ast.ExprNode)
@@ -10610,33 +10624,39 @@ SelectStmt:
 			st.GroupBy = $3.(*ast.GroupByClause)
 		}
 		if $4 != nil {
-			st.OrderBy = $4.(*ast.OrderByClause)
+			st.Qualify = $4.(*ast.QualifyClause)
 		}
 		if $5 != nil {
-			st.Limit = $5.(*ast.Limit)
+			st.OrderBy = $5.(*ast.OrderByClause)
 		}
-		if $7 != nil {
-			st.SelectIntoOpt = $7.(*ast.SelectIntoOption)
+		if $6 != nil {
+			st.Limit = $6.(*ast.Limit)
+		}
+		if $8 != nil {
+			st.SelectIntoOpt = $8.(*ast.SelectIntoOption)
 		}
 		$$ = st
 	}
-|	SelectStmtFromDualTable SelectStmtGroup OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
+|	SelectStmtFromDualTable SelectStmtGroup QualifyClause OrderByOptional SelectStmtLimitOpt SelectLockOpt SelectStmtIntoOption
 	{
 		st := $1.(*ast.SelectStmt)
 		if $2 != nil {
 			st.GroupBy = $2.(*ast.GroupByClause)
 		}
 		if $3 != nil {
-			st.OrderBy = $3.(*ast.OrderByClause)
+			st.Qualify = $3.(*ast.QualifyClause)
 		}
 		if $4 != nil {
-			st.Limit = $4.(*ast.Limit)
+			st.OrderBy = $4.(*ast.OrderByClause)
 		}
 		if $5 != nil {
-			st.LockInfo = $5.(*ast.SelectLockInfo)
+			st.Limit = $5.(*ast.Limit)
 		}
 		if $6 != nil {
-			st.SelectIntoOpt = $6.(*ast.SelectIntoOption)
+			st.LockInfo = $6.(*ast.SelectLockInfo)
+		}
+		if $7 != nil {
+			st.SelectIntoOpt = $7.(*ast.SelectIntoOption)
 		}
 		$$ = st
 	}

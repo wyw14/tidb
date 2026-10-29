@@ -143,6 +143,7 @@ var defaultExpectedReceivers = []string{
 	"GrantStmt",
 	"GroupByClause",
 	"HavingClause",
+	"QualifyClause",
 	"HelpStmt",
 	"ImportIntoActionStmt",
 	"ImportIntoStmt",

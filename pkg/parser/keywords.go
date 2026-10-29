@@ -183,6 +183,7 @@ var Keywords = []KeywordsType{
 	{"PRECISION", true, "reserved"},
 	{"PRIMARY", true, "reserved"},
 	{"PROCEDURE", true, "reserved"},
+	{"QUALIFY", true, "reserved"},
 	{"RANGE", true, "reserved"},
 	{"RANK", true, "reserved"},
 	{"READ", true, "reserved"},

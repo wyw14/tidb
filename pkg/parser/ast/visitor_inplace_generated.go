@@ -963,6 +963,16 @@ func (n *HavingClause) AcceptInPlace(v InPlaceVisitor) bool {
 	return v.Leave(n)
 }
 
+func (n *QualifyClause) AcceptInPlace(v InPlaceVisitor) bool {
+	if skipChildren := v.Enter(n); skipChildren {
+		return v.Leave(n)
+	}
+	if !n.Expr.AcceptInPlace(v) {
+		return false
+	}
+	return v.Leave(n)
+}
+
 func (n *OrderByClause) AcceptInPlace(v InPlaceVisitor) bool {
 	if skipChildren := v.Enter(n); skipChildren {
 		return v.Leave(n)
@@ -1052,6 +1062,11 @@ func (n *SelectStmt) AcceptInPlace(v InPlaceVisitor) bool {
 	}
 	if n.Having != nil {
 		if !n.Having.AcceptInPlace(v) {
+			return false
+		}
+	}
+	if n.Qualify != nil {
+		if !n.Qualify.AcceptInPlace(v) {
 			return false
 		}
 	}
