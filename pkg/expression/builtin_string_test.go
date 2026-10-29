@@ -758,6 +758,98 @@ func TestStrcmp(t *testing.T) {
 	}
 }
 
+func TestLevenshteinDistance(t *testing.T) {
+	ctx := createContext(t)
+	cases := []struct {
+		args   []any
+		isNil  bool
+		getErr bool
+		res    int64
+	}{
+		// exact distance without max_distance
+		{[]any{"kitten", "sitting"}, false, false, 3},
+		{[]any{"sitting", "kitten"}, false, false, 3},
+		{[]any{"abc", "abc"}, false, false, 0},
+		{[]any{"", ""}, false, false, 0},
+		{[]any{"", "abc"}, false, false, 3},
+		{[]any{"abc", ""}, false, false, 3},
+		{[]any{"abc", "abcd"}, false, false, 1},
+		// the comparison is case-sensitive
+		{[]any{"Kitten", "kitten"}, false, false, 1},
+		// a transposition of adjacent characters is not a single operation
+		{[]any{"ab", "ba"}, false, false, 2},
+		// characters are Unicode code points
+		{[]any{"你好", "你好吗"}, false, false, 1},
+		{[]any{"你好世界", "你好吗"}, false, false, 2},
+		{[]any{"abc", "你好"}, false, false, 3},
+		// no Unicode normalization is applied
+		{[]any{"\u00e9", "e\u0301"}, false, false, 2},
+		// non-string constants are converted to strings
+		{[]any{123, "123"}, false, false, 0},
+		// max_distance returns the exact value when it is not below the distance
+		{[]any{"kitten", "sitting", int64(3)}, false, false, 3},
+		{[]any{"kitten", "sitting", int64(6)}, false, false, 3},
+		{[]any{"kitten", "sitting", int64(2)}, false, false, 3},
+		// otherwise it uniformly returns max_distance + 1
+		{[]any{"kitten", "sitting", int64(1)}, false, false, 2},
+		{[]any{"aaaaaaaaaa", "bbbbbbbbbb", int64(3)}, false, false, 4},
+		// cap 0 only accepts identical strings
+		{[]any{"abc", "abc", int64(0)}, false, false, 0},
+		{[]any{"abc", "abd", int64(0)}, false, false, 1},
+		// empty strings still take part in the computation
+		{[]any{"", "", int64(0)}, false, false, 0},
+		{[]any{"", "abc", int64(3)}, false, false, 3},
+		{[]any{"", "abc", int64(2)}, false, false, 3},
+		// any NULL argument yields NULL
+		{[]any{nil, "abc"}, true, false, 0},
+		{[]any{"abc", nil}, true, false, 0},
+		{[]any{nil, nil}, true, false, 0},
+		{[]any{"abc", "abc", nil}, true, false, 0},
+		{[]any{nil, "abc", int64(1)}, true, false, 0},
+		{[]any{"abc", nil, int64(1)}, true, false, 0},
+		// invalid caps
+		{[]any{"abc", "abd", int64(-1)}, false, true, 0},
+		{[]any{"abc", "abd", int64(1<<63 - 1)}, false, true, 0},
+	}
+	for _, c := range cases {
+		f, err := newFunctionForTest(ctx, ast.LevenshteinDistance, primitiveValsToConstants(ctx, c.args)...)
+		require.NoError(t, err)
+		d, err := f.Eval(ctx, chunk.Row{})
+		if c.getErr {
+			require.Error(t, err)
+			require.True(t, terror.ErrorEqual(err, errIncorrectArgs), "unexpected error: %v", err)
+		} else {
+			require.NoError(t, err)
+			if c.isNil {
+				require.Equal(t, types.KindNull, d.Kind())
+			} else {
+				require.Equal(t, c.res, d.GetInt64())
+			}
+		}
+	}
+}
+
+// TestLevenshteinDistanceBandedAgainstExact cross-checks the capped algorithm
+// against the exact one over a range of small inputs and caps.
+func TestLevenshteinDistanceBandedAgainstExact(t *testing.T) {
+	samples := []string{"", "a", "ab", "ba", "abc", "kitten", "sitting", "你好", "你好吗", "\u00e9", "e\u0301"}
+	for _, left := range samples {
+		for _, right := range samples {
+			exact := levenshteinDistance(left, right)
+			for cap := int64(0); cap <= 8; cap++ {
+				got, capped := levenshteinDistanceWithCap(left, right, int(cap))
+				if exact <= cap {
+					require.False(t, capped)
+					require.Equal(t, exact, got, "left=%q right=%q cap=%d", left, right, cap)
+				} else {
+					require.True(t, capped)
+					require.Equal(t, cap+1, got, "left=%q right=%q cap=%d", left, right, cap)
+				}
+			}
+		}
+	}
+}
+
 func TestReplace(t *testing.T) {
 	ctx := createContext(t)
 	cases := []struct {

@@ -4789,3 +4789,71 @@ func enableNonStarterDeployModeForEmbeddingTest(t *testing.T) {
 		require.NoError(t, deploymode.Set(originalMode))
 	})
 }
+
+func TestLevenshteinDistanceBuiltin(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+
+	// constant arguments, exact distances
+	tk.MustQuery("SELECT LEVENSHTEIN_DISTANCE('kitten', 'sitting')").Check(testkit.Rows("3"))
+	tk.MustQuery("SELECT levenshtein_distance('sitting', 'kitten')").Check(testkit.Rows("3"))
+	tk.MustQuery("SELECT levenshtein_distance('', 'abc')").Check(testkit.Rows("3"))
+	tk.MustQuery("SELECT levenshtein_distance('abc', '')").Check(testkit.Rows("3"))
+	tk.MustQuery("SELECT levenshtein_distance('', '')").Check(testkit.Rows("0"))
+	// case-sensitive, no transposition step
+	tk.MustQuery("SELECT levenshtein_distance('Kitten', 'kitten')").Check(testkit.Rows("1"))
+	tk.MustQuery("SELECT levenshtein_distance('ab', 'ba')").Check(testkit.Rows("2"))
+	// Unicode code points without normalization: U+00E9 vs "e" + U+0301
+	tk.MustQuery("SELECT levenshtein_distance('你好', '你好吗')").Check(testkit.Rows("1"))
+	tk.MustQuery("SELECT levenshtein_distance(_utf8mb4 0xC3A9, _utf8mb4 0x65CC81)").Check(testkit.Rows("2"))
+	// constant arguments, capped distances
+	tk.MustQuery("SELECT levenshtein_distance('kitten', 'sitting', 1)").Check(testkit.Rows("2"))
+	tk.MustQuery("SELECT levenshtein_distance('kitten', 'sitting', 2)").Check(testkit.Rows("3"))
+	tk.MustQuery("SELECT levenshtein_distance('kitten', 'sitting', 3)").Check(testkit.Rows("3"))
+	tk.MustQuery("SELECT levenshtein_distance('abc', 'abc', 0)").Check(testkit.Rows("0"))
+	tk.MustQuery("SELECT levenshtein_distance('abc', 'abd', 0)").Check(testkit.Rows("1"))
+	// NULL arguments
+	tk.MustQuery("SELECT levenshtein_distance(NULL, 'abc')").Check(testkit.Rows("<nil>"))
+	tk.MustQuery("SELECT levenshtein_distance('abc', NULL)").Check(testkit.Rows("<nil>"))
+	tk.MustQuery("SELECT levenshtein_distance('abc', 'abc', NULL)").Check(testkit.Rows("<nil>"))
+	// invalid argument count is rejected while compiling
+	tk.MustContainErrMsg("SELECT levenshtein_distance('abc')", "Incorrect parameter count")
+	tk.MustContainErrMsg("SELECT levenshtein_distance('abc', 'abc', 1, 2)", "Incorrect parameter count")
+	// invalid caps are evaluated per row
+	err := tk.QueryToErr("SELECT levenshtein_distance('abc', 'abd', -1)")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Incorrect arguments to levenshtein_distance")
+	err = tk.QueryToErr("SELECT levenshtein_distance('abc', 'abd', 9223372036854775807)")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Incorrect arguments to levenshtein_distance")
+
+	// column arguments: the code-point comparison contract must hold regardless
+	// of the column collation (case-sensitive even for case-insensitive collations).
+	tk.MustExec(`CREATE TABLE t(
+		id int,
+		name_bin varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+		name_ci varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+		name_ucs varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci)`)
+	tk.MustExec("INSERT INTO t VALUES (1, 'Kitten', 'Kitten', 'Kitten'), (2, 'sitting', 'sitting', 'sitting'), (3, 'kittenx', 'kittenx', 'kittenx'), (4, NULL, NULL, NULL)")
+	tk.MustQuery(`SELECT levenshtein_distance(name_bin, 'kitten'),
+			levenshtein_distance(name_ci, 'kitten'),
+			levenshtein_distance(name_ucs, 'kitten')
+		FROM t ORDER BY id`).Check(testkit.Rows(
+		"1 1 1",
+		"3 3 3",
+		"1 1 1",
+		"<nil> <nil> <nil>"))
+	tk.MustQuery("SELECT id FROM t WHERE levenshtein_distance(name_ci, 'kitten') <= 1 ORDER BY id").Check(testkit.Rows("1", "3"))
+	tk.MustQuery("SELECT id, levenshtein_distance(name_bin, 'kitten', 2) FROM t ORDER BY id").Check(testkit.Rows(
+		"1 1",
+		"2 3",
+		"3 1",
+		"4 <nil>"))
+	// max_distance is provided by a column as well
+	tk.MustQuery("SELECT id, levenshtein_distance(name_bin, 'kitten', id) FROM t ORDER BY id").Check(testkit.Rows(
+		"1 1",
+		"2 3",
+		"3 1",
+		"4 <nil>"))
+}

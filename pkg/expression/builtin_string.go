@@ -83,6 +83,7 @@ var (
 	_ functionClass = &toBase64FunctionClass{}
 	_ functionClass = &insertFunctionClass{}
 	_ functionClass = &instrFunctionClass{}
+	_ functionClass = &levenshteinDistanceFunctionClass{}
 	_ functionClass = &loadFileFunctionClass{}
 	_ functionClass = &weightStringFunctionClass{}
 )
@@ -105,6 +106,8 @@ var (
 	_ builtinFunc = &builtinUpperUTF8Sig{}
 	_ builtinFunc = &builtinUpperSig{}
 	_ builtinFunc = &builtinStrcmpSig{}
+	_ builtinFunc = &builtinLevenshteinDistanceSig{}
+	_ builtinFunc = &builtinLevenshteinDistanceWithCapSig{}
 	_ builtinFunc = &builtinReplaceSig{}
 	_ builtinFunc = &builtinConvertSig{}
 	_ builtinFunc = &builtinSubstring2ArgsSig{}
@@ -1028,6 +1031,216 @@ func (b *builtinStrcmpSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool,
 	}
 	res := b.collator().Compare(left, right)
 	return int64(res), false, nil
+}
+
+type levenshteinDistanceFunctionClass struct {
+	baseFunctionClass
+}
+
+func (c *levenshteinDistanceFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	argTps := []types.EvalType{types.ETString, types.ETString}
+	hasMaxDistance := len(args) == 3
+	if hasMaxDistance {
+		argTps = append(argTps, types.ETInt)
+	}
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, argTps...)
+	if err != nil {
+		return nil, err
+	}
+	// The result never exceeds the character length of the longer argument.
+	bf.tp.SetFlen(11)
+	types.SetBinChsClnFlag(bf.tp)
+	if hasMaxDistance {
+		// LEVENSHTEIN_DISTANCE is a TiDB native function without a corresponding
+		// tipb signature, so it is never pushed down to a storage node.
+		return &builtinLevenshteinDistanceWithCapSig{bf}, nil
+	}
+	return &builtinLevenshteinDistanceSig{bf}, nil
+}
+
+type builtinLevenshteinDistanceSig struct {
+	baseBuiltinFunc
+
+	// NOTE: Any new fields added here must be thread-safe or immutable during execution,
+	// as this expression may be shared across sessions.
+	// If a field does not meet these requirements, set SafeToShareAcrossSession to false.
+}
+
+func (b *builtinLevenshteinDistanceSig) Clone() builtinFunc {
+	newSig := &builtinLevenshteinDistanceSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals LEVENSHTEIN_DISTANCE(left_text, right_text).
+// It returns the minimum number of single-character insertions, deletions and
+// substitutions needed to turn left_text into right_text.
+func (b *builtinLevenshteinDistanceSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, error) {
+	left, isNull, err := b.args[0].EvalString(ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	right, isNull, err := b.args[1].EvalString(ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return levenshteinDistance(left, right), false, nil
+}
+
+type builtinLevenshteinDistanceWithCapSig struct {
+	baseBuiltinFunc
+
+	// NOTE: Any new fields added here must be thread-safe or immutable during execution,
+	// as this expression may be shared across sessions.
+	// If a field does not meet these requirements, set SafeToShareAcrossSession to false.
+}
+
+func (b *builtinLevenshteinDistanceWithCapSig) Clone() builtinFunc {
+	newSig := &builtinLevenshteinDistanceWithCapSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals LEVENSHTEIN_DISTANCE(left_text, right_text, max_distance).
+// It returns the exact distance when it is not greater than max_distance,
+// otherwise it returns max_distance + 1.
+func (b *builtinLevenshteinDistanceWithCapSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, error) {
+	left, isNull, err := b.args[0].EvalString(ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	right, isNull, err := b.args[1].EvalString(ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	maxDistance, isNull, err := b.args[2].EvalInt(ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	// A negative cap is invalid, and max_distance + 1 must fit into the BIGINT result.
+	if maxDistance < 0 || maxDistance >= math.MaxInt64 {
+		return 0, false, errIncorrectArgs.GenWithStackByArgs(ast.LevenshteinDistance)
+	}
+	distance, capped := levenshteinDistanceWithCap(left, right, int(maxDistance))
+	if capped {
+		return maxDistance + 1, false, nil
+	}
+	return distance, false, nil
+}
+
+// levenshteinDistance returns the exact Levenshtein distance between two
+// strings. Characters are compared by Unicode code point: the comparison is
+// case-sensitive, never applies Unicode normalization, and a transposition of
+// two adjacent characters costs two operations. The comparison contract does
+// not depend on the collation of the arguments.
+func levenshteinDistance(left, right string) int64 {
+	longer, shorter := longerShorterRunes(left, right)
+	prev := make([]int, len(shorter)+1)
+	cur := make([]int, len(shorter)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(longer); i++ {
+		cur[0] = i
+		for j := 1; j <= len(shorter); j++ {
+			substitutionCost := 1
+			if longer[i-1] == shorter[j-1] {
+				substitutionCost = 0
+			}
+			cur[j] = minLevenshteinCell(prev[j]+1, cur[j-1]+1, prev[j-1]+substitutionCost)
+		}
+		prev, cur = cur, prev
+	}
+	return int64(prev[len(shorter)])
+}
+
+// levenshteinDistanceWithCap returns the exact Levenshtein distance when it is
+// not greater than cap, otherwise it returns cap+1 with capped set to true.
+// Only the diagonal band of cells whose distance can be at most cap is
+// evaluated, so strings whose lengths differ by more than cap are resolved
+// immediately.
+func levenshteinDistanceWithCap(left, right string, cap int) (distance int64, capped bool) {
+	longer, shorter := longerShorterRunes(left, right)
+	n, m := len(longer), len(shorter)
+	if n-m > cap {
+		return int64(cap) + 1, true
+	}
+	outOfBand := cap + 1
+	prev := make([]int, m+1)
+	cur := make([]int, m+1)
+	for j := 1; j <= m; j++ {
+		if j <= cap {
+			prev[j] = j
+		} else {
+			prev[j] = outOfBand
+		}
+	}
+	for i := 1; i <= n; i++ {
+		cur[0] = i
+		rowMin := i
+		lo, hi := 1, m
+		if low := int64(i) - int64(cap); low > 1 {
+			lo = int(low)
+		}
+		if high := int64(i) + int64(cap); high < int64(m) {
+			hi = int(high)
+		}
+		for j := 1; j <= m; j++ {
+			if j < lo || j > hi {
+				cur[j] = outOfBand
+				continue
+			}
+			substitutionCost := 1
+			if longer[i-1] == shorter[j-1] {
+				substitutionCost = 0
+			}
+			v := minLevenshteinCell(prev[j]+1, cur[j-1]+1, prev[j-1]+substitutionCost)
+			if v > cap {
+				v = outOfBand
+			}
+			cur[j] = v
+			if v < rowMin {
+				rowMin = v
+			}
+		}
+		// Every remaining edit path crosses this row, so a distance above the
+		// cap here can never drop back to the cap.
+		if rowMin > cap {
+			return int64(outOfBand), true
+		}
+		prev, cur = cur, prev
+	}
+	if prev[m] > cap {
+		return int64(outOfBand), true
+	}
+	return int64(prev[m]), false
+}
+
+// longerShorterRunes decodes both strings into Unicode code points and returns
+// the longer slice first to minimize the width of the DP rows.
+func longerShorterRunes(left, right string) (longer, shorter []rune) {
+	l := []rune(left)
+	r := []rune(right)
+	if len(l) >= len(r) {
+		return l, r
+	}
+	return r, l
+}
+
+// minLevenshteinCell returns the smallest of the three DP predecessors, all of
+// which are non-negative.
+func minLevenshteinCell(deletion, insertion, substitution int) int {
+	m := deletion
+	if insertion < m {
+		m = insertion
+	}
+	if substitution < m {
+		m = substitution
+	}
+	return m
 }
 
 type replaceFunctionClass struct {

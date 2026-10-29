@@ -530,6 +530,19 @@ var vecBuiltinStringCases2 = map[string][]vecExprBenchCase{
 			),
 		}},
 	},
+	ast.LevenshteinDistance: {
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETString, types.ETString}},
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETString, types.ETString, types.ETInt}, geners: []dataGenerator{
+			nil,
+			nil,
+			newRangeInt64Gener(0, 6),
+		}},
+		{retEvalType: types.ETInt, childrenTypes: []types.EvalType{types.ETString, types.ETString, types.ETInt}, geners: []dataGenerator{
+			newSelectStringGener([]string{"kitten", "sitting", ""}),
+			newSelectStringGener([]string{"kitten", "sitting", ""}),
+			newRangeInt64Gener(0, 4),
+		}},
+	},
 	ast.Format: {
 		{retEvalType: types.ETString, childrenTypes: []types.EvalType{types.ETDecimal, types.ETInt}, geners: []dataGenerator{
 			newRangeDecimalGener(-10000, 10000, 0),

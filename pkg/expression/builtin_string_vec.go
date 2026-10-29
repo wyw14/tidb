@@ -1299,6 +1299,22 @@ func (b *builtinStrcmpSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, resul
 	return nil
 }
 
+func (b *builtinLevenshteinDistanceSig) vectorized() bool {
+	return true
+}
+
+func (b *builtinLevenshteinDistanceSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
+	return vecEvalIntByRows(ctx, b, input, result)
+}
+
+func (b *builtinLevenshteinDistanceWithCapSig) vectorized() bool {
+	return true
+}
+
+func (b *builtinLevenshteinDistanceWithCapSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, result *chunk.Column) error {
+	return vecEvalIntByRows(ctx, b, input, result)
+}
+
 func (b *builtinLocate2ArgsSig) vectorized() bool {
 	return true
 }
